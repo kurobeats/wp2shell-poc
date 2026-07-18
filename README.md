@@ -253,7 +253,9 @@ REST API nonce keys, and recent transients.
 
 All commands support `--targets` / `-t` to read URLs from a file (one per line,
 `#` for comments). Per-line flags `--rest-route`, `--proxy`, and `--timeout`
-override the global defaults for that target only:
+override the global defaults for that target only.
+
+Add `--threads N` for parallel scanning:
 
 ```bash
 # targets.txt:
@@ -262,11 +264,15 @@ http://target2.com/ --rest-route
 http://target3.com/ --rest-route --proxy http://127.0.0.1:8080
 http://target4.com/ --timeout 60
 
-# Usage:
+# Sequential (default):
 python3 wp2shell.py check --targets targets.txt --confirm-sqli
-python3 wp2shell.py extract --targets targets.txt --preset users --fast
-python3 wp2shell.py rce --targets targets.txt --plugin --user admin --password 'pw'
-python3 wp2shell.py probe --targets targets.txt
+
+# Parallel with 10 threads:
+python3 wp2shell.py check --targets targets.txt --confirm-sqli --threads 10
+
+# Other commands:
+python3 wp2shell.py extract --targets targets.txt --preset users --fast --threads 5
+python3 wp2shell.py probe --targets targets.txt --threads 10
 ```
 
 ---

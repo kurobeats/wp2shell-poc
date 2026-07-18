@@ -23,6 +23,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import http.cookiejar
 import io
 import json
@@ -1281,6 +1283,8 @@ def build_parser() -> argparse.ArgumentParser:
     prb = sub.add_parser("probe", help="map admin endpoints via route confusion")
     prb.add_argument("url", nargs="?", help="target base URL")
     prb.add_argument("--targets", "-t", help="file with target URLs, one per line")
+    prb.add_argument("--threads", type=int, default=0,
+                     help="parallel threads for --targets (default: sequential)")
     prb.add_argument("--rest-route", action="store_true")
     prb.add_argument("--timeout", type=float, default=30.0)
     prb.add_argument("--proxy", help="HTTP proxy")
@@ -1292,6 +1296,8 @@ def build_parser() -> argparse.ArgumentParser:
     chk = sub.add_parser("check", help="non-destructive vulnerability detection")
     chk.add_argument("url", nargs="?", help="target base URL")
     chk.add_argument("--targets", "-t", help="file with target URLs, one per line")
+    chk.add_argument("--threads", type=int, default=0,
+                     help="parallel threads for --targets (default: sequential)")
     chk.add_argument("--rest-route", action="store_true",
                      help="use ?rest_route=/batch/v1")
     chk.add_argument("--timeout", type=float, default=30.0)
@@ -1309,6 +1315,8 @@ def build_parser() -> argparse.ArgumentParser:
     ext = sub.add_parser("extract", help="read database via blind SQLi")
     ext.add_argument("url", nargs="?", help="target base URL")
     ext.add_argument("--targets", "-t", help="file with target URLs, one per line")
+    ext.add_argument("--threads", type=int, default=0,
+                     help="parallel threads for --targets (default: sequential)")
     ext.add_argument("--rest-route", action="store_true")
     ext.add_argument("--timeout", type=float, default=30.0)
     ext.add_argument("--proxy", help="HTTP proxy")
@@ -1326,6 +1334,8 @@ def build_parser() -> argparse.ArgumentParser:
     rce = sub.add_parser("rce", help="remote code execution")
     rce.add_argument("url", nargs="?", help="target base URL")
     rce.add_argument("--targets", "-t", help="file with target URLs, one per line")
+    rce.add_argument("--threads", type=int, default=0,
+                     help="parallel threads for --targets (default: sequential)")
     rce.add_argument("--rest-route", action="store_true")
     rce.add_argument("--timeout", type=float, default=30.0)
     rce.add_argument("--proxy", help="HTTP proxy")
@@ -1397,40 +1407,78 @@ def _run_with_targets(args: argparse.Namespace) -> int:
             bad(f"no targets found in {args.targets}")
             return 1
         info(f"loaded {len(targets)} target(s) from {args.targets}")
-        results = []
-        for i, (url, overrides) in enumerate(targets, 1):
-            label = url
-            if overrides.get("rest_route"):
-                label += " [rest-route]"
-            if overrides.get("proxy"):
-                label += f" [proxy={overrides['proxy']}]"
-            info(f"[{i}/{len(targets)}] {label}")
-            args.url = url
-            # Apply per-line overrides
-            saved = {}
-            for key, val in overrides.items():
-                saved[key] = getattr(args, key, None)
-                setattr(args, key, val)
-            try:
-                results.append(args.func(args))
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as e:
-                warn(f"  failed: {e}")
-                results.append(1)
-            finally:
-                # Restore original values
-                for key, val in saved.items():
-                    setattr(args, key, val)
-        failures = sum(1 for r in results if r != 0)
-        if failures:
-            warn(f"{failures}/{len(results)} target(s) returned non-zero")
-        return 0 if failures == 0 else 1
+        threads = max(1, getattr(args, "threads", 0) or 0)
+        if threads > 1:
+            return _run_parallel(args, targets, threads)
+        return _run_sequential(args, targets)
     else:
         if not args.url:
             bad("specify URL or --targets FILE")
             return 1
         return args.func(args)
+
+
+def _run_sequential(args: argparse.Namespace,
+                    targets: List[Tuple[str, dict]]) -> int:
+    results = []
+    for i, (url, overrides) in enumerate(targets, 1):
+        info(f"[{i}/{len(targets)}] {url}")
+        _apply_overrides(args, overrides)
+        try:
+            results.append(args.func(args))
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            warn(f"  failed: {e}")
+            results.append(1)
+        finally:
+            _restore_overrides(args, overrides)
+    failures = sum(1 for r in results if r != 0)
+    if failures:
+        warn(f"{failures}/{len(results)} target(s) returned non-zero")
+    return 0 if failures == 0 else 1
+
+
+def _run_parallel(args: argparse.Namespace,
+                  targets: List[Tuple[str, dict]], threads: int) -> int:
+    results = []
+    # Copy args per target to avoid cross-thread mutation
+    args_copies = [(url, overrides, copy.deepcopy(args))
+                   for url, overrides in targets]
+    info(f"running {len(targets)} target(s) with {threads} thread(s)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(_run_one_target, a, url, ov)
+                   for url, ov, a in args_copies}
+        for f in concurrent.futures.as_completed(futures):
+            results.append(f.result())
+    failures = sum(1 for r in results if r != 0)
+    if failures:
+        warn(f"{failures}/{len(results)} target(s) returned non-zero")
+    return 0 if failures == 0 else 1
+
+
+def _run_one_target(args: argparse.Namespace, url: str,
+                    overrides: dict) -> int:
+    _apply_overrides(args, overrides)
+    args.url = url
+    try:
+        return args.func(args)
+    except Exception:
+        return 1
+    finally:
+        _restore_overrides(args, overrides)
+
+
+def _apply_overrides(args: argparse.Namespace, overrides: dict) -> None:
+    for key, val in overrides.items():
+        setattr(args, f"_saved_{key}", getattr(args, key, None))
+        setattr(args, key, val)
+
+
+def _restore_overrides(args: argparse.Namespace, overrides: dict) -> None:
+    for key in overrides:
+        saved = getattr(args, f"_saved_{key}", None)
+        setattr(args, key, saved)
 
 
 def main(argv: Optional[list] = None) -> int:
