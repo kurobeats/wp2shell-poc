@@ -22,16 +22,14 @@ WordPress 6.9.4, two core abilities are REST-accessible:
 ability has a write side effect or weak `permission_callback`.
 
 **Lead:** A plugin or theme that registers an ability with `show_in_rest: true`
-and a weak or missing `permission_callback` could provide pre-auth RCE via the
-abilities `/run` endpoint. The endpoint itself has no hardcoded auth — it
-delegates entirely to the ability's `permission_callback`. If that callback
-is missing or returns `true`, the ability executes unauthenticated.
+and a `permission_callback` that returns `true` could provide pre-auth RCE via
+the abilities `/run` endpoint. The endpoint itself has no hardcoded auth — it
+delegates entirely to the ability's `permission_callback`.
 
-**To research further:**
-- Audit popular plugins for abilities with `permission_callback` omitted
-- Test whether `permission_callback` defaults to `true` when not set
-- Test whether a plugin ability with `execute_callback` that writes files or
-  spawns processes can be reached via route confusion
+**Researched:** `WP_Ability::check_permissions()` returns `WP_Error` when
+`permission_callback` is not callable (missing/null). It does NOT default to
+`true`. Stock WordPress is secure — this is only exploitable via a vulnerable
+plugin that explicitly sets `permission_callback` to return `true`.
 
 #### Research: `secure_file_priv = NULL`
 MySQL/MariaDB default to `secure_file_priv = NULL` (no restriction) in many
