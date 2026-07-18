@@ -57,20 +57,6 @@ the DB server AND served by the web server. `secure_file_priv = NULL` helps
 
 ## Tooling
 
-### sqlmap integration unreliable
-The `wp2shell_tamper.py` tamper script replaces the POST body with the
-double-confusion JSON, but sqlmap parses the original `--data` as JSON
-form fields and sends with wrong Content-Type. All requests return
-HTTP 400.
-
-**Workaround:** Use `wp2shell.py extract` for blind extraction. Use
-`wp2shell_tamper.py` standalone mode for time-based extraction with
-nonce recovery.
-
-**Fix:** Custom sqlmap proxy or `--eval`-based request builder that
-bypasses sqlmap's JSON parsing. Alternatively, write a sqlmap
-`--udf` injection module.
-
 ### Fast extractor endpoint dependency
 The fast X-WP-Total extraction mode embeds probes in `/wp/v2/categories`
 requests. If the `categories` taxonomy is removed or the endpoint is
