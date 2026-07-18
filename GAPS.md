@@ -112,10 +112,4 @@ Not tested:
 - Multisite / network-mode WordPress
 - Plugins that register Abilities API endpoints with weak permissions
 
-## Documentation
 
-### Password cracking guidance
-The README mentions offline hash cracking but doesn't cover:
-- Hash format conversion (`$wp$` phpass → hashcat mode 400)
-- Recommended wordlists and rules
-- GPU acceleration vs CPU-only cracking time estimates

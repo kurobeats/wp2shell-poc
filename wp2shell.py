@@ -1350,14 +1350,42 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _read_targets(path: str) -> List[str]:
-    """Read target URLs from file, one per line, skip blanks and comments."""
+def _read_targets(path: str) -> List[Tuple[str, dict]]:
+    """Read target URLs from file, one per line, skip blanks and comments.
+
+    Lines may include per-target flags after the URL:
+        http://target.com/ --rest-route
+        http://target.com/ --rest-route --proxy http://127.0.0.1:8080
+        http://target.com/ --timeout 60
+
+    Returns list of (url, overrides_dict).
+    """
     targets = []
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line and not line.startswith("#"):
-                targets.append(line)
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            url = parts[0]
+            overrides = {}
+            i = 1
+            while i < len(parts):
+                if parts[i] == "--rest-route":
+                    overrides["rest_route"] = True
+                    i += 1
+                elif parts[i] == "--proxy" and i + 1 < len(parts):
+                    overrides["proxy"] = parts[i + 1]
+                    i += 2
+                elif parts[i] == "--timeout" and i + 1 < len(parts):
+                    try:
+                        overrides["timeout"] = float(parts[i + 1])
+                    except ValueError:
+                        pass
+                    i += 2
+                else:
+                    i += 1
+            targets.append((url, overrides))
     return targets
 
 
@@ -1370,9 +1398,19 @@ def _run_with_targets(args: argparse.Namespace) -> int:
             return 1
         info(f"loaded {len(targets)} target(s) from {args.targets}")
         results = []
-        for i, url in enumerate(targets, 1):
-            info(f"[{i}/{len(targets)}] {url}")
+        for i, (url, overrides) in enumerate(targets, 1):
+            label = url
+            if overrides.get("rest_route"):
+                label += " [rest-route]"
+            if overrides.get("proxy"):
+                label += f" [proxy={overrides['proxy']}]"
+            info(f"[{i}/{len(targets)}] {label}")
             args.url = url
+            # Apply per-line overrides
+            saved = {}
+            for key, val in overrides.items():
+                saved[key] = getattr(args, key, None)
+                setattr(args, key, val)
             try:
                 results.append(args.func(args))
             except (KeyboardInterrupt, SystemExit):
@@ -1380,6 +1418,10 @@ def _run_with_targets(args: argparse.Namespace) -> int:
             except Exception as e:
                 warn(f"  failed: {e}")
                 results.append(1)
+            finally:
+                # Restore original values
+                for key, val in saved.items():
+                    setattr(args, key, val)
         failures = sum(1 for r in results if r != 0)
         if failures:
             warn(f"{failures}/{len(results)} target(s) returned non-zero")

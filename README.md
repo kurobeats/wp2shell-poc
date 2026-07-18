@@ -252,13 +252,15 @@ REST API nonce keys, and recent transients.
 ### `--targets` — Multi-target scanning
 
 All commands support `--targets` / `-t` to read URLs from a file (one per line,
-`#` for comments):
+`#` for comments). Per-line flags `--rest-route`, `--proxy`, and `--timeout`
+override the global defaults for that target only:
 
 ```bash
-# File format:
-# http://target1.com/
-# http://target2.com/
-# http://target3.com/  --rest-route  (per-line flags not supported)
+# targets.txt:
+http://target1.com/
+http://target2.com/ --rest-route
+http://target3.com/ --rest-route --proxy http://127.0.0.1:8080
+http://target4.com/ --timeout 60
 
 # Usage:
 python3 wp2shell.py check --targets targets.txt --confirm-sqli
