@@ -706,6 +706,20 @@ def detect_version(client: BatchClient, c: C, v: bool = False
                 break
     except Exception:
         pass
+    # ponytail: readme.html is always present, contains version in plain text.
+    # Most reliable source on fresh installs with no posts/pages.
+    try:
+        resp = client.get("/readme.html")
+        if resp.status < 400:
+            for m in re.finditer(r"<h1[^>]*>\s*WordPress\s+([\d.]+)\s*</h1>",
+                                 resp.body, re.IGNORECASE):
+                found.append(m.group(1))
+            for m in re.finditer(r"[Vv]ersion\s+(\d+\.\d+(?:\.\d+)?)",
+                                 resp.body):
+                found.append(m.group(1))
+                break
+    except Exception:
+        pass
     for rv in found:
         ver = parse_version(rv)
         if ver:
