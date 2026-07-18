@@ -8,6 +8,10 @@ privilege has **not been publicly disclosed**. The 6.9.5 / 7.0.2 patch adds
 `is_dispatching()` guards in both `serve_request()` and `rest_api_loaded()`,
 indicating the chain relied on recursive REST dispatch.
 
+ZephrFish's [code trace deep dive](https://blog.zsec.uk/wp2shell-code-trace-deep-dive/)
+(2026-07-18) confirms the same chain: route confusion → SQLi → crack admin
+hash → plugin upload. No pre-auth RCE path without FILE or credentials.
+
 #### Research: Abilities API (`wp-abilities/v1`)
 The Abilities API (`/wp-abilities/v1/abilities/<name>/run`) accepts ALL HTTP methods
 and delegates `permission_callback` to the individual registered ability. On stock
