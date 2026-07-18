@@ -73,15 +73,6 @@ nonce recovery.
 bypasses sqlmap's JSON parsing. Alternatively, write a sqlmap
 `--udf` injection module.
 
-### Version detection on fresh installs
-`detect_version()` probes `/wp-json/`, homepage meta tags, and RSS
-feeds. On fresh Docker installs with no posts/pages, these often
-return nothing. `/readme.html` is always present and contains the
-version in plain text (`<h1>WordPress 6.9.4</h1>`) but is not
-currently checked.
-
-**Easy fix:** Add `readme.html` parsing to `detect_version()`.
-
 ### Fast extractor endpoint dependency
 The fast X-WP-Total extraction mode embeds probes in `/wp/v2/categories`
 requests. If the `categories` taxonomy is removed or the endpoint is
