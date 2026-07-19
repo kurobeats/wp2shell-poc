@@ -2,15 +2,24 @@
 
 ## Exploitation
 
-### Pre-auth RCE without FILE privilege
-The original Assetnote chain that achieves pre-auth RCE without MySQL `FILE`
-privilege has **not been publicly disclosed**. The 6.9.5 / 7.0.2 patch adds
-`is_dispatching()` guards in both `serve_request()` and `rest_api_loaded()`,
-indicating the chain relied on recursive REST dispatch.
+### ~~Pre-auth RCE without FILE privilege~~ **RESOLVED**
 
-ZephrFish's [code trace deep dive](https://blog.zsec.uk/wp2shell-code-trace-deep-dive/)
-(2026-07-18) confirms the same chain: route confusion → SQLi → crack admin
-hash → plugin upload. No pre-auth RCE path without FILE or credentials.
+Implemented as `--escalate` mode (sergiointel PoC integration). Full chain:
+**route confusion → SQLi → oEmbed cache poisoning → UNION SELECT post recast
+→ changeset escalation → admin creation → plugin upload → RCE**
+
+No FILE privilege. No password cracking. No credentials.
+
+Tested on all 6 available Docker Hub images (6.9.0, 6.9.1, 6.9.2, 6.9.4, 7.0.0, 7.0.1):
+100% RCE.
+
+#### Original Assetnote chain (recursive REST dispatch)
+
+The 6.9.5 / 7.0.2 patch adds `is_dispatching()` guards in both `serve_request()`
+and `rest_api_loaded()`, indicating the discoverer's original chain relied on
+recursive REST dispatch. This path remains **not publicly disclosed** — the
+`--escalate` chain is an independent technique (oEmbed poisoning + UNION SELECT
+post recast), not the recursive-dispatch path.
 
 #### Research: Abilities API (`wp-abilities/v1`)
 The Abilities API (`/wp-abilities/v1/abilities/<name>/run`) accepts ALL HTTP methods

